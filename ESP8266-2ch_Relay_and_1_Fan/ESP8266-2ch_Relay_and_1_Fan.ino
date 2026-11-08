@@ -7,9 +7,9 @@
 #include <PubSubClient.h>
 #include <EEPROM.h>
 #include <arduino-timer.h>
-#include <Preferences.h>
+#include <AceButton.h>
 
-Preferences preferences;
+using namespace ace_button;
 
 // --- Default Fallback Credentials ---
 const char* DEFAULT_SSID = "ash_jio_2G";
@@ -64,21 +64,22 @@ auto timer = timer_create_default();
 #define FanSwitchPin   D7  // GPIO 13 - Fan On/Off Switch
 #define TriacPin       D8  // GPIO 15 - Triac Gate Output
 
-// --- EEPROM Addresses ---
+// --- EEPROM Configuration Storage Layout (512 bytes) ---
 #define EEPROM_RELAY1      0
 #define EEPROM_RELAY2      1
 #define EEPROM_DIMMER      7
 #define EEPROM_TRIAC_STATE 8
+#define EEPROM_CFG_START   16 // SSID, Pass, MQTT config stored securely via JSON in EEPROM
 
 #define DIMMER_MIN 0
 #define DIMMER_MAX 9
 
-// --- Button Debouncing & State Tracking (5 Inputs) ---
-bool buttonLastStates[5] = {HIGH, HIGH, HIGH, HIGH, HIGH};
-unsigned long buttonPressStartTime[5] = {0, 0, 0, 0, 0};
-bool buttonHeldTriggered[5] = {false, false, false, false, false};
-bool buttonIsDown[5] = {false, false, false, false, false};
-const unsigned long LONG_PRESS_THRESHOLD = 1200; // 1.2s for long press
+// --- AceButton Instances ---
+AceButton buttonRelay1(SwitchPin1, HIGH);
+AceButton buttonRelay2(SwitchPin2, HIGH);
+AceButton buttonFanOnOff(FanSwitchPin, HIGH);
+AceButton buttonDimDown(DimmerDownPin, HIGH);
+AceButton buttonDimUp(DimmerUpPin, HIGH);
 
 // --- Web Server & MQTT ---
 ESP8266WebServer server(80);
@@ -94,7 +95,7 @@ String consoleLogBuffer = "";
 // --- Wi-Fi Reconnection & AP Fallback State ---
 unsigned long lastWiFiCheckTime = 0;
 const unsigned long WIFI_RETRY_INTERVAL = 10000; 
-unsigned long wifiDisconnectedStartTime = 0;        
+unsigned long wifiDisconnectedStartTime = 0;       
 const unsigned long WIFI_AP_FALLBACK_TIMEOUT = 600000; // 10 minutes
 bool apModeActive = false;
 
@@ -116,15 +117,15 @@ void dimm_Up();
 void dimm_Dn();
 void eepromState();
 bool sendPeriodicStatus(void*);
+void handleButtonEvent(AceButton* button, uint8_t eventType, uint8_t buttonState);
 
 // --- Phase Control: Hardware Timer 1 Callback (Fires Triac Pulse) ---
 void IRAM_ATTR onTimer1Fire()
 {
   digitalWrite(TriacPin, HIGH);
-  // Keep gate open for 30 microseconds using short inline CPU delay
   os_delay_us(30); 
   digitalWrite(TriacPin, LOW);
-  timer1_disable(); // Stop timer until next Zero-Cross event
+  timer1_disable();
 }
 
 // --- Zero-Cross Interrupt (Arms Hardware Timer 1 instantly) ---
@@ -132,8 +133,7 @@ void IRAM_ATTR handleZeroCross()
 {
   if (triacState && dimm_value > 0)
   {
-    // Arm Hardware Timer 1 in microsecond mode (TIM_SINGLE shot mode)
-    timer1_write(spd[dimm_value] * 5); // 80MHz clock ticks conversion factor (~5 ticks per microsecond at divider 16)
+    timer1_write(spd[dimm_value] * 5);
     timer1_enable(TIM_DIV16, TIM_EDGE, TIM_SINGLE);
   }
 }
@@ -292,31 +292,52 @@ const char CONFIG_PAGE[] PROGMEM = R"rawliteral(
 </html>
 )rawliteral";
 
-// --- Preferences Config Storage ---
+// --- EEPROM Config Storage Helpers ---
 void loadConfig() {
-    preferences.begin("config", false);
-    stored_ssid = preferences.getString("ssid", DEFAULT_SSID);
-    stored_password = preferences.getString("password", DEFAULT_PASSWORD);
-    mqtt_server = preferences.getString("server", DEFAULT_MQTT_SERVER);
-    mqtt_port = preferences.getInt("port", DEFAULT_MQTT_PORT);
-    mqtt_user = preferences.getString("user", DEFAULT_MQTT_USER);
-    mqtt_pass = preferences.getString("pass", DEFAULT_MQTT_PASS);
-    mqtt_topic_cmd = preferences.getString("tcmd", DEFAULT_MQTT_TOPIC_CMD);
-    mqtt_topic_state = preferences.getString("tstate", DEFAULT_MQTT_TOPIC_STATE);
-    preferences.end();
+    char buffer[256];
+    for (int i = 0; i < 256; i++) buffer[i] = EEPROM.read(EEPROM_CFG_START + i);
+    
+    JsonDocument doc;
+    DeserializationError error = deserializeJson(doc, buffer);
+    if (error) {
+        // Fallback defaults
+        stored_ssid = DEFAULT_SSID;
+        stored_password = DEFAULT_PASSWORD;
+        mqtt_server = DEFAULT_MQTT_SERVER;
+        mqtt_port = DEFAULT_MQTT_PORT;
+        mqtt_user = DEFAULT_MQTT_USER;
+        mqtt_pass = DEFAULT_MQTT_PASS;
+        mqtt_topic_cmd = DEFAULT_MQTT_TOPIC_CMD;
+        mqtt_topic_state = DEFAULT_MQTT_TOPIC_STATE;
+    } else {
+        stored_ssid = doc["ssid"] | DEFAULT_SSID;
+        stored_password = doc["pass"] | DEFAULT_PASSWORD;
+        mqtt_server = doc["srv"] | DEFAULT_MQTT_SERVER;
+        mqtt_port = doc["prt"] | DEFAULT_MQTT_PORT;
+        mqtt_user = doc["usr"] | DEFAULT_MQTT_USER;
+        mqtt_pass = doc["pwd"] | DEFAULT_MQTT_PASS;
+        mqtt_topic_cmd = doc["tCmd"] | DEFAULT_MQTT_TOPIC_CMD;
+        mqtt_topic_state = doc["tState"] | DEFAULT_MQTT_TOPIC_STATE;
+    }
 }
 
 void saveConfig(String ssid, String pass, String srv, int prt, String usr, String pwd, String tCmd, String tState) {
-    preferences.begin("config", false);
-    preferences.putString("ssid", ssid);
-    preferences.putString("password", pass);
-    preferences.putString("server", srv);
-    preferences.putInt("port", prt);
-    preferences.putString("user", usr);
-    preferences.putString("pass", pwd);
-    preferences.putString("tcmd", tCmd);
-    preferences.putString("tstate", tState);
-    preferences.end();
+    JsonDocument doc;
+    doc["ssid"] = ssid;
+    doc["pass"] = pass;
+    doc["srv"] = srv;
+    doc["prt"] = prt;
+    doc["usr"] = usr;
+    doc["pwd"] = pwd;
+    doc["tCmd"] = tCmd;
+    doc["tState"] = tState;
+
+    char buffer[256];
+    serializeJson(doc, buffer);
+    for (int i = 0; i < 256; i++) {
+        EEPROM.write(EEPROM_CFG_START + i, buffer[i]);
+    }
+    EEPROM.commit();
 }
 
 void logMessage(String msg) {
@@ -389,46 +410,31 @@ void eepromState() {
     triacState = (EEPROM.read(EEPROM_TRIAC_STATE) == 1 || dimm_value > 0);
 }
 
-// --- Wall Switch & Button Handler ---
-void handleWallSwitches() {
-    uint8_t pins[5] = {SwitchPin1, SwitchPin2, FanSwitchPin, DimmerDownPin, DimmerUpPin};
-    unsigned long currentMillis = millis();
+// --- AceButton Event Handler ---
+void handleButtonEvent(AceButton* button, uint8_t eventType, uint8_t buttonState) {
+    uint8_t pin = button->getPin();
 
-    for (int i = 0; i < 5; i++) {
-        bool currentState = digitalRead(pins[i]);
-        if (currentState != buttonLastStates[i]) {
-            delay(15); // Debounce
-            currentState = digitalRead(pins[i]);
-            if (currentState != buttonLastStates[i]) {
-                buttonLastStates[i] = currentState;
-                if (i < 2) {
-                    if (i == 0) relayToggle(1);
-                    if (i == 1) relayToggle(2);
-                } else {
-                    if (currentState == LOW) {
-                        buttonIsDown[i] = true;
-                        buttonPressStartTime[i] = currentMillis;
-                        buttonHeldTriggered[i] = false;
-                    } else {
-                        if (buttonIsDown[i]) {
-                            buttonIsDown[i] = false;
-                            if (!buttonHeldTriggered[i]) {
-                                if (i == 2) triacOnOff();
-                                else if (i == 3) dimm_Dn();
-                                else if (i == 4) dimm_Up();
-                            }
-                        }
-                    }
-                }
-            }
+    if (eventType == AceButton::kEventPressed) {
+        if (pin == SwitchPin1) {
+            relayToggle(1);
+        } else if (pin == SwitchPin2) {
+            relayToggle(2);
+        } else if (pin == FanSwitchPin) {
+            triacOnOff();
+        } else if (pin == DimmerDownPin) {
+            dimm_Dn();
+        } else if (pin == DimmerUpPin) {
+            dimm_Up();
         }
-        // Long hold check for Dimmer Down / Up
-        if ((i == 3 || i == 4) && buttonIsDown[i] && !buttonHeldTriggered[i]) {
-            if (currentMillis - buttonPressStartTime[i] >= LONG_PRESS_THRESHOLD) {
-                buttonHeldTriggered[i] = true;
-                if (i == 3) setDimmerLevel(DIMMER_MIN);
-                else setDimmerLevel(DIMMER_MAX);
-            }
+    } 
+    // Handle Long Press / Held to jump directly to Min/Max brightness
+    else if (eventType == AceButton::kEventLongPressed) {
+        if (pin == DimmerDownPin) {
+            setDimmerLevel(DIMMER_MIN);
+            logMessage(">> Long Press: Dimmer set to MIN");
+        } else if (pin == DimmerUpPin) {
+            setDimmerLevel(DIMMER_MAX);
+            logMessage(">> Long Press: Dimmer set to MAX");
         }
     }
 }
@@ -489,15 +495,19 @@ void checkWiFiConnection() {
     }
 }
 
+// Non-blocking MQTT reconnect handler to completely prevent UI lockups
 void reconnectMQTT() {
     if (!apModeActive && !mqttClient.connected() && WiFi.status() == WL_CONNECTED) {
         static unsigned long lastRetry = 0;
-        if (millis() - lastRetry > 10000) {
+        if (millis() - lastRetry > 15000) {
             lastRetry = millis();
             String clientId = "ESP8266-" + String(ESP.getChipId());
+            // Non-blocking connect attempt
             if (mqttClient.connect(clientId.c_str(), mqtt_user.c_str(), mqtt_pass.c_str())) {
                 mqttClient.subscribe(mqtt_topic_cmd.c_str());
                 logMessage(">> MQTT Connected & Subscribed!");
+            } else {
+                logMessage(">> MQTT Connection failed, will retry...");
             }
         }
     }
@@ -550,15 +560,29 @@ void setup() {
     pinMode(TriacPin, OUTPUT);
 
     pinMode(ZeroCrossPin, INPUT_PULLUP);
-    pinMode(DimmerUpPin, INPUT_PULLUP);
-    pinMode(DimmerDownPin, INPUT_PULLUP);
     pinMode(SwitchPin1, INPUT_PULLUP);
     pinMode(SwitchPin2, INPUT_PULLUP);
     pinMode(FanSwitchPin, INPUT_PULLUP);
+    pinMode(DimmerDownPin, INPUT_PULLUP);
+    pinMode(DimmerUpPin, INPUT_PULLUP);
 
     digitalWrite(RelayPin1, HIGH);
     digitalWrite(RelayPin2, HIGH);
     digitalWrite(TriacPin, LOW);
+
+    // Initialize AceButton Configs
+    ButtonConfig* btnConfig = ButtonConfig::getSystemButtonConfig();
+    btnConfig->setFeature(ButtonConfig::kFeatureClick);
+    btnConfig->setFeature(ButtonConfig::kFeatureLongPress);
+    btnConfig->setLongPressDelay(1000); // 1 second hold for long press (Corrected method name)
+
+    buttonRelay1.init(SwitchPin1);
+    buttonRelay2.init(SwitchPin2);
+    buttonFanOnOff.init(FanSwitchPin);
+    buttonDimDown.init(DimmerDownPin);
+    buttonDimUp.init(DimmerUpPin);
+
+    btnConfig->setEventHandler(handleButtonEvent);
 
     // Initialize Hardware Timer 1 for non-blocking phase control
     timer1_isr_init();
@@ -636,6 +660,11 @@ bool sendPeriodicStatus(void*) {
 void loop() {
     if (apModeActive) {
         server.handleClient();
+        buttonRelay1.check();
+        buttonRelay2.check();
+        buttonFanOnOff.check();
+        buttonDimDown.check();
+        buttonDimUp.check();
         return;
     }
 
@@ -643,11 +672,19 @@ void loop() {
 
     if (!mqttClient.connected()) {
         reconnectMQTT();
+    } else {
+        mqttClient.loop();
     }
-    mqttClient.loop();
+    
     server.handleClient();
 
-    handleWallSwitches();
+    // Check all physical buttons through AceButton
+    buttonRelay1.check();
+    buttonRelay2.check();
+    buttonFanOnOff.check();
+    buttonDimDown.check();
+    buttonDimUp.check();
+
     timer.tick();
 
     while (Serial.available()) {
