@@ -108,6 +108,7 @@ void reconnectMQTT();
 void callbackMQTT(char* topic, byte* payload, unsigned int length);
 String getStateJson(String logMsg = "");
 void logMessage(String msg);
+void broadcastState();
 void checkWiFiConnection();
 void enterAPMode();
 void setRelayState(int relay, bool turnOn);
@@ -349,6 +350,24 @@ void logMessage(String msg) {
     consoleLogBuffer += msg + "\n";
 }
 
+// --- Instant State Broadcast (Serial & MQTT Echo) ---
+void broadcastState() {
+    JsonDocument doc;
+    doc["POWER1"] = relayStates[0] ? "ON" : "OFF";
+    doc["POWER2"] = relayStates[1] ? "ON" : "OFF";
+    doc["Dimmer"] = dimm_value;
+    String out;
+    serializeJson(doc, out);
+
+    // Echo to Serial Terminal Log
+    logMessage(">> STATE BROADCAST: " + out);
+
+    // Echo to MQTT Broker
+    if (mqttClient.connected()) {
+        mqttClient.publish(mqtt_topic_state.c_str(), out.c_str());
+    }
+}
+
 // --- Dimmer & Triac Control ---
 void setDimmerLevel(uint8_t val) {
     if (val > DIMMER_MAX) val = DIMMER_MAX;
@@ -358,6 +377,7 @@ void setDimmerLevel(uint8_t val) {
     EEPROM.write(EEPROM_TRIAC_STATE, triacState ? 1 : 0);
     EEPROM.commit();
     logMessage(">> Dimmer set to: " + String(dimm_value));
+    broadcastState(); // Instant echo across serial & MQTT
 }
 
 void triacOn() {
@@ -392,6 +412,7 @@ void setRelayState(int relay, bool turnOn) {
     EEPROM.commit();
     relayStates[relay - 1] = turnOn;
     logMessage(">> Relay " + String(relay) + " -> " + (turnOn ? "ON" : "OFF"));
+    broadcastState(); // Instant echo across serial & MQTT
 }
 
 void relayToggle(int relay) {
@@ -492,7 +513,6 @@ void enterAPMode() {
             deviceIp = "192.168.4.1";
         }
 
-        // Clean minimal redirect matching user preference
         String html = "<script>setTimeout(function(){ window.location.href = 'http://" + deviceIp + "/'; }, 3500);</script>";
         html += "<h3>Settings Saved! Rebooting...</h3>";
 
@@ -531,6 +551,7 @@ void reconnectMQTT() {
             if (mqttClient.connect(clientId.c_str(), mqtt_user.c_str(), mqtt_pass.c_str())) {
                 mqttClient.subscribe(mqtt_topic_cmd.c_str());
                 logMessage(">> MQTT Connected & Subscribed!");
+                broadcastState(); // Broadcast state on fresh connection
             } else {
                 logMessage(">> MQTT Connection failed, will retry...");
             }
@@ -546,15 +567,7 @@ void callbackMQTT(char* topic, byte* payload, unsigned int length) {
 }
 
 bool sendPeriodicStatus(void*) {
-    JsonDocument doc;
-    doc["POWER1"] = relayStates[0] ? "ON" : "OFF";
-    doc["POWER2"] = relayStates[1] ? "ON" : "OFF";
-    doc["Dimmer"] = dimm_value;
-    String out;
-    serializeJson(doc, out);
-    if (mqttClient.connected()) {
-        mqttClient.publish(mqtt_topic_state.c_str(), out.c_str());
-    }
+    broadcastState();
     return true;
 }
 
@@ -570,11 +583,11 @@ void handleCommand(String cmd) {
     else if (cmd == "ALL_ON") { setRelayState(1, true); setRelayState(2, true); setDimmerLevel(DIMMER_MAX); }
     else if (cmd == "ALL_OFF") { setRelayState(1, false); setRelayState(2, false); setDimmerLevel(DIMMER_MIN); }
     else if (cmd == "STATUS") {
-        logMessage(">> [STATUS REQUEST] Refreshing MQTT & Loading Device States...");
+        logMessage(">> [STATUS REQUEST] Refreshing States...");
         if (!mqttClient.connected()) {
             reconnectMQTT();
         }
-        sendPeriodicStatus(nullptr);
+        broadcastState();
         logMessage("-> Relay 1: " + String(relayStates[0] ? "ON" : "OFF"));
         logMessage("-> Relay 2: " + String(relayStates[1] ? "ON" : "OFF"));
         logMessage("-> Fan Dimmer Level: " + String(dimm_value) + " (Triac: " + String(triacState ? "ACTIVE" : "OFF") + ")");
@@ -703,11 +716,10 @@ void setup() {
         );
 
         String deviceIp = WiFi.localIP().toString();
-        if (deviceIp == "0.0.0.0" || deviceIp == "") {
+        if (apModeActive || deviceIp == "0.0.0.0") {
             deviceIp = "192.168.4.1";
         }
 
-        // Clean minimal redirect matching your preferred format
         String html = "<script>setTimeout(function(){ window.location.href = 'http://" + deviceIp + "/'; }, 3500);</script>";
         html += "<h3>Settings Saved! Rebooting...</h3>";
 
