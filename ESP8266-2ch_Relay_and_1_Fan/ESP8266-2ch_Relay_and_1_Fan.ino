@@ -69,7 +69,7 @@ auto timer = timer_create_default();
 #define EEPROM_RELAY2      1
 #define EEPROM_DIMMER      7
 #define EEPROM_TRIAC_STATE 8
-#define EEPROM_CFG_START   16 // SSID, Pass, MQTT config stored securely via JSON in EEPROM
+#define EEPROM_CFG_START   16 
 
 #define DIMMER_MIN 0
 #define DIMMER_MAX 9
@@ -300,7 +300,6 @@ void loadConfig() {
     JsonDocument doc;
     DeserializationError error = deserializeJson(doc, buffer);
     if (error) {
-        // Fallback defaults
         stored_ssid = DEFAULT_SSID;
         stored_password = DEFAULT_PASSWORD;
         mqtt_server = DEFAULT_MQTT_SERVER;
@@ -427,7 +426,6 @@ void handleButtonEvent(AceButton* button, uint8_t eventType, uint8_t buttonState
             dimm_Up();
         }
     } 
-    // Handle Long Press / Held to jump directly to Min/Max brightness
     else if (eventType == AceButton::kEventLongPressed) {
         if (pin == DimmerDownPin) {
             setDimmerLevel(DIMMER_MIN);
@@ -495,14 +493,12 @@ void checkWiFiConnection() {
     }
 }
 
-// Non-blocking MQTT reconnect handler to completely prevent UI lockups
 void reconnectMQTT() {
     if (!apModeActive && !mqttClient.connected() && WiFi.status() == WL_CONNECTED) {
         static unsigned long lastRetry = 0;
         if (millis() - lastRetry > 15000) {
             lastRetry = millis();
             String clientId = "ESP8266-" + String(ESP.getChipId());
-            // Non-blocking connect attempt
             if (mqttClient.connect(clientId.c_str(), mqtt_user.c_str(), mqtt_pass.c_str())) {
                 mqttClient.subscribe(mqtt_topic_cmd.c_str());
                 logMessage(">> MQTT Connected & Subscribed!");
@@ -520,6 +516,19 @@ void callbackMQTT(char* topic, byte* payload, unsigned int length) {
     handleCommand(msg);
 }
 
+bool sendPeriodicStatus(void*) {
+    JsonDocument doc;
+    doc["POWER1"] = relayStates[0] ? "ON" : "OFF";
+    doc["POWER2"] = relayStates[1] ? "ON" : "OFF";
+    doc["Dimmer"] = dimm_value;
+    String out;
+    serializeJson(doc, out);
+    if (mqttClient.connected()) {
+        mqttClient.publish(mqtt_topic_state.c_str(), out.c_str());
+    }
+    return true;
+}
+
 void handleCommand(String cmd) {
     cmd.trim();
     if (cmd == "POWER1 ON") setRelayState(1, true);
@@ -531,7 +540,18 @@ void handleCommand(String cmd) {
     else if (cmd == "DIMM_DN") dimm_Dn();
     else if (cmd == "ALL_ON") { setRelayState(1, true); setRelayState(2, true); setDimmerLevel(DIMMER_MAX); }
     else if (cmd == "ALL_OFF") { setRelayState(1, false); setRelayState(2, false); setDimmerLevel(DIMMER_MIN); }
-    else if (cmd == "STATUS") sendPeriodicStatus(nullptr);
+    else if (cmd == "STATUS") {
+        logMessage(">> [STATUS REQUEST] Refreshing MQTT & Loading Device States...");
+        if (!mqttClient.connected()) {
+            reconnectMQTT();
+        }
+        // Force publish status and print states of all connected loads
+        sendPeriodicStatus(nullptr);
+        logMessage("-> Relay 1: " + String(relayStates[0] ? "ON" : "OFF"));
+        logMessage("-> Relay 2: " + String(relayStates[1] ? "ON" : "OFF"));
+        logMessage("-> Fan Dimmer Level: " + String(dimm_value) + " (Triac: " + String(triacState ? "ACTIVE" : "OFF") + ")");
+        logMessage("-> MQTT Status: " + String(mqttClient.connected() ? "CONNECTED" : "DISCONNECTED"));
+    }
 }
 
 String getStateJson(String logMsg) {
@@ -570,11 +590,10 @@ void setup() {
     digitalWrite(RelayPin2, HIGH);
     digitalWrite(TriacPin, LOW);
 
-    // Initialize AceButton Configs
     ButtonConfig* btnConfig = ButtonConfig::getSystemButtonConfig();
     btnConfig->setFeature(ButtonConfig::kFeatureClick);
     btnConfig->setFeature(ButtonConfig::kFeatureLongPress);
-    btnConfig->setLongPressDelay(1000); // 1 second hold for long press (Corrected method name)
+    btnConfig->setLongPressDelay(1000);
 
     buttonRelay1.init(SwitchPin1);
     buttonRelay2.init(SwitchPin2);
@@ -584,11 +603,9 @@ void setup() {
 
     btnConfig->setEventHandler(handleButtonEvent);
 
-    // Initialize Hardware Timer 1 for non-blocking phase control
     timer1_isr_init();
     timer1_attachInterrupt(onTimer1Fire);
 
-    // Attach Zero Cross Interrupt
     attachInterrupt(digitalPinToInterrupt(ZeroCrossPin), handleZeroCross, RISING);
 
     eepromState();
@@ -644,19 +661,6 @@ void setup() {
     timer.every(10000, sendPeriodicStatus);
 }
 
-bool sendPeriodicStatus(void*) {
-    JsonDocument doc;
-    doc["POWER1"] = (digitalRead(RelayPin1) == LOW) ? "ON" : "OFF";
-    doc["POWER2"] = (digitalRead(RelayPin2) == LOW) ? "ON" : "OFF";
-    doc["Dimmer"] = dimm_value;
-    String out;
-    serializeJson(doc, out);
-    if (mqttClient.connected()) {
-        mqttClient.publish(mqtt_topic_state.c_str(), out.c_str());
-    }
-    return true;
-}
-
 void loop() {
     if (apModeActive) {
         server.handleClient();
@@ -678,7 +682,6 @@ void loop() {
     
     server.handleClient();
 
-    // Check all physical buttons through AceButton
     buttonRelay1.check();
     buttonRelay2.check();
     buttonFanOnOff.check();
