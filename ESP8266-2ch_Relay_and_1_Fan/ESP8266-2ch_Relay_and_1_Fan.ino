@@ -486,7 +486,17 @@ void enterAPMode() {
             server.hasArg("mqtt_topic_cmd") ? server.arg("mqtt_topic_cmd") : DEFAULT_MQTT_TOPIC_CMD,
             server.hasArg("mqtt_topic_state") ? server.arg("mqtt_topic_state") : DEFAULT_MQTT_TOPIC_STATE
         );
-        server.send(200, "text/html", "<h3>Settings Saved! Rebooting...</h3>");
+
+        String deviceIp = WiFi.localIP().toString();
+        if (apModeActive || deviceIp == "0.0.0.0") {
+            deviceIp = "192.168.4.1";
+        }
+
+        // Clean minimal redirect matching user preference
+        String html = "<script>setTimeout(function(){ window.location.href = 'http://" + deviceIp + "/'; }, 3500);</script>";
+        html += "<h3>Settings Saved! Rebooting...</h3>";
+
+        server.send(200, "text/html", html);
         delay(1000);
         ESP.restart();
     });
@@ -691,7 +701,17 @@ void setup() {
             server.hasArg("mqtt_topic_cmd") ? server.arg("mqtt_topic_cmd") : DEFAULT_MQTT_TOPIC_CMD,
             server.hasArg("mqtt_topic_state") ? server.arg("mqtt_topic_state") : DEFAULT_MQTT_TOPIC_STATE
         );
-        server.send(200, "text/html", "<h3>Settings Saved! Rebooting...</h3>");
+
+        String deviceIp = WiFi.localIP().toString();
+        if (deviceIp == "0.0.0.0" || deviceIp == "") {
+            deviceIp = "192.168.4.1";
+        }
+
+        // Clean minimal redirect matching your preferred format
+        String html = "<script>setTimeout(function(){ window.location.href = 'http://" + deviceIp + "/'; }, 3500);</script>";
+        html += "<h3>Settings Saved! Rebooting...</h3>";
+
+        server.send(200, "text/html", html);
         delay(1000);
         ESP.restart();
     });
