@@ -452,10 +452,16 @@ void enterAPMode() {
     apModeActive = true;
     WiFi.disconnect();
     WiFi.mode(WIFI_AP);
-    WiFi.softAP("ESP8266-Setup-AP", "12345678");
     
-    logMessage(">> Entered AP Setup Mode: ESP8266-Setup-AP");
-    logMessage(">> AP IP Address: " + WiFi.softAPIP().toString());
+    const char* apSsid = "ESP8266-Setup-AP";
+    const char* apPass = "12345678";
+    
+    WiFi.softAP(apSsid, apPass);
+    
+    logMessage(">> Entered AP Setup Mode!");
+    logMessage(">> AP SSID:     " + String(apSsid));
+    logMessage(">> AP Password: " + String(apPass));
+    logMessage(">> AP IP Addr:  " + WiFi.softAPIP().toString());
 
     server.stop();
 
