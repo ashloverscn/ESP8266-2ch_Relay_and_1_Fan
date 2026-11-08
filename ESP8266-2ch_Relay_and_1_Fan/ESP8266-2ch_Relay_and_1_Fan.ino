@@ -39,16 +39,16 @@ volatile bool triacState = false;
 
 // 10 stages (0 to 9) mapped to microsecond delays from Zero Cross
 const uint16_t spd[10] = {
-  8500, // Stage 0: Min Brightness / Lowest Speed (~8.5ms delay)
-  7700, // Stage 1
-  6900, // Stage 2
-  6100, // Stage 3
-  5300, // Stage 4
-  4500, // Stage 5
-  3700, // Stage 6
-  2900, // Stage 7
-  2100, // Stage 8
-  800   // Stage 9: Max Brightness / Full ON (~0.8ms delay)
+    8500, // Stage 0: Min Brightness / Lowest Speed (~8.5ms delay)
+    7700, // Stage 1
+    6900, // Stage 2
+    6100, // Stage 3
+    5300, // Stage 4
+    4500, // Stage 5
+    3700, // Stage 6
+    2900, // Stage 7
+    2100, // Stage 8
+    800   // Stage 9: Max Brightness / Full ON (~0.8ms delay)
 };
 
 auto timer = timer_create_default();
@@ -69,6 +69,7 @@ auto timer = timer_create_default();
 #define EEPROM_RELAY2      1
 #define EEPROM_DIMMER      7
 #define EEPROM_TRIAC_STATE 8
+#define EEPROM_FIRST_BOOT  10 // 1 byte flag (0xFF = unconfigured first boot, 0x5A = configured)
 #define EEPROM_CFG_START   16 
 
 #define DIMMER_MIN 0
@@ -95,7 +96,7 @@ String consoleLogBuffer = "";
 // --- Wi-Fi Reconnection & AP Fallback State ---
 unsigned long lastWiFiCheckTime = 0;
 const unsigned long WIFI_RETRY_INTERVAL = 10000; 
-unsigned long wifiDisconnectedStartTime = 0;       
+unsigned long wifiDisconnectedStartTime = 0;        
 const unsigned long WIFI_AP_FALLBACK_TIMEOUT = 600000; // 10 minutes
 bool apModeActive = false;
 
@@ -122,10 +123,10 @@ void handleButtonEvent(AceButton* button, uint8_t eventType, uint8_t buttonState
 // --- Phase Control: Hardware Timer 1 Callback (Fires Triac Pulse) ---
 void IRAM_ATTR onTimer1Fire()
 {
-  digitalWrite(TriacPin, HIGH);
-  os_delay_us(30); 
-  digitalWrite(TriacPin, LOW);
-  timer1_disable();
+    digitalWrite(TriacPin, HIGH);
+    os_delay_us(30); 
+    digitalWrite(TriacPin, LOW);
+    timer1_disable();
 }
 
 // --- Zero-Cross Interrupt (Arms Hardware Timer 1 instantly) ---
@@ -336,6 +337,9 @@ void saveConfig(String ssid, String pass, String srv, int prt, String usr, Strin
     for (int i = 0; i < 256; i++) {
         EEPROM.write(EEPROM_CFG_START + i, buffer[i]);
     }
+    
+    // Mark configuration as explicitly saved (Exits first-boot state)
+    EEPROM.write(EEPROM_FIRST_BOOT, 0x5A);
     EEPROM.commit();
 }
 
@@ -409,6 +413,9 @@ void eepromState() {
     triacState = (EEPROM.read(EEPROM_TRIAC_STATE) == 1 || dimm_value > 0);
 }
 
+// Forward Declaration for AP Mode trigger
+void enterAPMode();
+
 // --- AceButton Event Handler ---
 void handleButtonEvent(AceButton* button, uint8_t eventType, uint8_t buttonState) {
     uint8_t pin = button->getPin();
@@ -433,16 +440,23 @@ void handleButtonEvent(AceButton* button, uint8_t eventType, uint8_t buttonState
         } else if (pin == DimmerUpPin) {
             setDimmerLevel(DIMMER_MAX);
             logMessage(">> Long Press: Dimmer set to MAX");
+        } else if (pin == FanSwitchPin) {
+            logMessage(">> Long Press detected on Fan Switch: Forcing AP Setup Mode...");
+            enterAPMode();
         }
     }
 }
 
-// --- AP Mode Fallback ---
+// --- AP Mode Setup & Server Portal ---
 void enterAPMode() {
     apModeActive = true;
     WiFi.disconnect();
     WiFi.mode(WIFI_AP);
     WiFi.softAP("ESP8266-Setup-AP", "12345678");
+    
+    logMessage(">> Entered AP Setup Mode: ESP8266-Setup-AP");
+    logMessage(">> AP IP Address: " + WiFi.softAPIP().toString());
+
     server.stop();
 
     server.on("/", [](){ server.send_P(200, "text/html", CONFIG_PAGE); });
@@ -471,7 +485,6 @@ void enterAPMode() {
         ESP.restart();
     });
     server.begin();
-    logMessage(">> Entered AP Setup Mode: ESP8266-Setup-AP");
 }
 
 void checkWiFiConnection() {
@@ -545,7 +558,6 @@ void handleCommand(String cmd) {
         if (!mqttClient.connected()) {
             reconnectMQTT();
         }
-        // Force publish status and print states of all connected loads
         sendPeriodicStatus(nullptr);
         logMessage("-> Relay 1: " + String(relayStates[0] ? "ON" : "OFF"));
         logMessage("-> Relay 2: " + String(relayStates[1] ? "ON" : "OFF"));
@@ -573,11 +585,13 @@ void setup() {
     EEPROM.begin(512);
     delay(1000);
 
-    loadConfig();
-
+    // Initialize pin modes early for safety
     pinMode(RelayPin1, OUTPUT);
     pinMode(RelayPin2, OUTPUT);
     pinMode(TriacPin, OUTPUT);
+    digitalWrite(RelayPin1, HIGH);
+    digitalWrite(RelayPin2, HIGH);
+    digitalWrite(TriacPin, LOW);
 
     pinMode(ZeroCrossPin, INPUT_PULLUP);
     pinMode(SwitchPin1, INPUT_PULLUP);
@@ -585,10 +599,6 @@ void setup() {
     pinMode(FanSwitchPin, INPUT_PULLUP);
     pinMode(DimmerDownPin, INPUT_PULLUP);
     pinMode(DimmerUpPin, INPUT_PULLUP);
-
-    digitalWrite(RelayPin1, HIGH);
-    digitalWrite(RelayPin2, HIGH);
-    digitalWrite(TriacPin, LOW);
 
     ButtonConfig* btnConfig = ButtonConfig::getSystemButtonConfig();
     btnConfig->setFeature(ButtonConfig::kFeatureClick);
@@ -603,6 +613,22 @@ void setup() {
 
     btnConfig->setEventHandler(handleButtonEvent);
 
+    // Check if first boot / unconfigured EEPROM
+    uint8_t firstBootFlag = EEPROM.read(EEPROM_FIRST_BOOT);
+    if (firstBootFlag != 0x5A) {
+        logMessage(">> First boot detected: Clearing EEPROM and entering AP mode...");
+        for (int i = 0; i < 256; i++) {
+            EEPROM.write(EEPROM_CFG_START + i, 0);
+        }
+        EEPROM.commit();
+        
+        loadConfig();
+        enterAPMode();
+        return; // Skip normal station startup
+    }
+
+    loadConfig();
+
     timer1_isr_init();
     timer1_attachInterrupt(onTimer1Fire);
 
@@ -614,6 +640,13 @@ void setup() {
     unsigned long startAttempt = millis();
     while (WiFi.status() != WL_CONNECTED && millis() - startAttempt < 15000) {
         delay(500);
+    }
+
+    if (WiFi.status() == WL_CONNECTED) {
+        logMessage(">> WiFi Connected Successfully!");
+        logMessage(">> Local IP Address: " + WiFi.localIP().toString());
+    } else {
+        logMessage(">> WiFi Connection Failed. Entering background retry mode...");
     }
 
     espClient.setInsecure();
