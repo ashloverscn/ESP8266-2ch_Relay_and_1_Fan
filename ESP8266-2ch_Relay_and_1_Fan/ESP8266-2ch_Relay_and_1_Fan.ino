@@ -35,7 +35,7 @@ String mqtt_topic_state;
 // --- Controller State ---
 bool relayStates[2] = {false, false};
 uint8_t dimm_value = 0; // 0 to 9
-bool triacState = false;
+volatile bool triacState = false;
 
 // 10 stages (0 to 9) mapped to microsecond delays from Zero Cross
 const uint16_t spd[10] = {
@@ -63,7 +63,6 @@ auto timer = timer_create_default();
 #define SwitchPin2     D6  // GPIO 12 - Wall Switch for Relay 2
 #define FanSwitchPin   D7  // GPIO 13 - Fan On/Off Switch
 #define TriacPin       D8  // GPIO 15 - Triac Gate Output
-// Note: RX (GPIO 3) is free for normal Serial monitoring at 115200
 
 // --- EEPROM Addresses ---
 #define EEPROM_RELAY1      0
@@ -118,15 +117,24 @@ void dimm_Dn();
 void eepromState();
 bool sendPeriodicStatus(void*);
 
-// --- Zero-Cross Interrupt for AC Phase Control ---
+// --- Phase Control: Hardware Timer 1 Callback (Fires Triac Pulse) ---
+void IRAM_ATTR onTimer1Fire()
+{
+  digitalWrite(TriacPin, HIGH);
+  // Keep gate open for 30 microseconds using short inline CPU delay
+  os_delay_us(30); 
+  digitalWrite(TriacPin, LOW);
+  timer1_disable(); // Stop timer until next Zero-Cross event
+}
+
+// --- Zero-Cross Interrupt (Arms Hardware Timer 1 instantly) ---
 void IRAM_ATTR handleZeroCross()
 {
   if (triacState && dimm_value > 0)
   {
-    delayMicroseconds(spd[dimm_value]);
-    digitalWrite(TriacPin, HIGH);
-    delayMicroseconds(30);
-    digitalWrite(TriacPin, LOW);
+    // Arm Hardware Timer 1 in microsecond mode (TIM_SINGLE shot mode)
+    timer1_write(spd[dimm_value] * 5); // 80MHz clock ticks conversion factor (~5 ticks per microsecond at divider 16)
+    timer1_enable(TIM_DIV16, TIM_EDGE, TIM_SINGLE);
   }
 }
 
@@ -551,6 +559,10 @@ void setup() {
     digitalWrite(RelayPin1, HIGH);
     digitalWrite(RelayPin2, HIGH);
     digitalWrite(TriacPin, LOW);
+
+    // Initialize Hardware Timer 1 for non-blocking phase control
+    timer1_isr_init();
+    timer1_attachInterrupt(onTimer1Fire);
 
     // Attach Zero Cross Interrupt
     attachInterrupt(digitalPinToInterrupt(ZeroCrossPin), handleZeroCross, RISING);
